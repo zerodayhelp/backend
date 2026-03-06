@@ -1,0 +1,628 @@
+// bulk-email-sender.js
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const fs = require('fs').promises;
+const fsSync = require('fs');
+const readline = require('readline');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const axios = require('axios');
+const UserAgent = require('user-agents');
+
+// Add stealth plugin to avoid detection
+puppeteer.use(StealthPlugin());
+
+// Configuration
+const CONFIG = {
+  // File paths
+  maillistFile: 'maillist.txt',
+  letterFile: 'letter.html',
+  proxyFile: 'proxies.txt',
+  userAgentFile: 'useragents.txt',
+  outputFile: 'results.json',
+  logFile: 'sender.log',
+  
+  // Settings
+  maxRetries: 3,
+  delayBetweenEmails: 2000, // 2 seconds
+  headlessMode: false, // Set to true for background execution
+  concurrentEmails: 1, // Number of concurrent emails (keep at 1 to avoid rate limits)
+  
+  // Email settings
+  emailSubject: "Your Email Subject Here",
+  
+  // Proxy settings
+  useProxy: false,
+  rotateProxy: true,
+  proxyTimeout: 10000,
+  
+  // User agent settings
+  rotateUserAgent: true
+};
+
+// Statistics
+const stats = {
+  total: 0,
+  sent: 0,
+  failed: 0,
+  skipped: 0,
+  startTime: null,
+  endTime: null
+};
+
+// Results storage
+let results = [];
+
+// Logger
+async function log(message, type = 'INFO') {
+  const timestamp = new Date().toISOString();
+  const logMessage = `[${timestamp}] [${type}] ${message}`;
+  
+  console.log(logMessage);
+  
+  try {
+    await fs.appendFile(CONFIG.logFile, logMessage + '\n');
+  } catch (error) {
+    // Ignore logging errors
+  }
+}
+
+// Read file lines
+async function readFileLines(filePath) {
+  try {
+    const content = await fs.readFile(filePath, 'utf8');
+    return content.split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
+}
+
+// Read HTML template
+async function readHtmlTemplate(filePath) {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    log(`Error reading HTML template: ${error.message}`, 'ERROR');
+    // Return default template
+    return `<!DOCTYPE html>
+<html>
+  <body>
+    <h1>Test Email</h1>
+    <p>This is a default template.</p>
+  </body>
+</html>`;
+  }
+}
+
+// Parse proxy string
+function parseProxy(proxyString) {
+  try {
+    // Format: ip:port:username:password or ip:port or protocol://user:pass@host:port
+    if (proxyString.includes('@')) {
+      // Already in URL format
+      return new URL(proxyString);
+    } else {
+      // Parse ip:port:username:password format
+      const parts = proxyString.split(':');
+      if (parts.length === 4) {
+        const [ip, port, username, password] = parts;
+        return new URL(`http://${username}:${password}@${ip}:${port}`);
+      } else if (parts.length === 2) {
+        // ip:port format
+        const [ip, port] = parts;
+        return new URL(`http://${ip}:${port}`);
+      }
+    }
+    return null;
+  } catch (error) {
+    log(`Error parsing proxy: ${proxyString} - ${error.message}`, 'WARN');
+    return null;
+  }
+}
+
+// Get random user agent
+async function getRandomUserAgent() {
+  try {
+    if (CONFIG.rotateUserAgent) {
+      // Read user agents from file
+      const userAgents = await readFileLines(CONFIG.userAgentFile);
+      if (userAgents.length > 0) {
+        const randomIndex = Math.floor(Math.random() * userAgents.length);
+        return userAgents[randomIndex];
+      }
+    }
+  } catch (error) {
+    log(`Error reading user agents file: ${error.message}`, 'WARN');
+  }
+  
+  // Default fallback
+  return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
+}
+
+// Get random proxy
+async function getRandomProxy(proxyList) {
+  if (!CONFIG.useProxy || proxyList.length === 0) {
+    return null;
+  }
+  
+  const randomIndex = Math.floor(Math.random() * proxyList.length);
+  return parseProxy(proxyList[randomIndex]);
+}
+
+// Initialize browser with proxy
+async function initBrowser(proxyUrl = null, userAgent = null) {
+  const launchOptions = {
+    headless: CONFIG.headlessMode,
+    defaultViewport: { width: 1280, height: 800 },
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-blink-features=AutomationControlled'
+    ]
+  };
+  
+  // Add proxy if provided (without credentials)
+  if (proxyUrl) {
+    // Extract proxy info without credentials for the --proxy-server argument
+    const proxyHost = `${proxyUrl.hostname}:${proxyUrl.port}`;
+    launchOptions.args.push(`--proxy-server=${proxyUrl.protocol}//${proxyHost}`);
+    
+    log(`Using proxy: ${proxyHost}`, 'PROXY');
+  }
+  
+  // Add user agent if provided
+  if (userAgent) {
+    launchOptions.args.push(`--user-agent=${userAgent}`);
+  }
+  
+  try {
+    const browser = await puppeteer.launch(launchOptions);
+    return { browser, proxyUrl };
+  } catch (error) {
+    log(`Failed to launch browser: ${error.message}`, 'ERROR');
+    throw error;
+  }
+}
+
+// Solve challenge and get session
+async function solveChallenge(page, email, retryCount = 0, proxyUrl = null) {
+  try {
+    log(`Solving challenge for ${email} (attempt ${retryCount + 1}/${CONFIG.maxRetries})...`);
+    
+    // Navigate to react.email
+    await page.goto('https://react.email', {
+      waitUntil: 'networkidle2',
+      timeout: 30000
+    });
+
+    // Wait for page to stabilize
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    // Check for challenge
+    const pageTitle = await page.title();
+    if (pageTitle.includes('Security Checkpoint')) {
+      log('Security challenge detected, waiting for completion...', 'CHALLENGE');
+      
+      // Wait for challenge to complete
+      await page.waitForFunction(() => {
+        return !document.title.includes('Security Checkpoint');
+      }, { timeout: 30000 }).catch(() => {
+        log('Challenge timeout, but continuing...', 'WARN');
+      });
+      
+      // Additional wait
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+    // Navigate to markdown page
+    await page.goto('https://react.email/components/markdown', {
+      waitUntil: 'networkidle2',
+      timeout: 30000
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Get session info
+    const sessionInfo = await page.evaluate(() => {
+      return {
+        cookies: document.cookie,
+        hasLocalStorage: !!localStorage.length
+      };
+    });
+
+    log('Challenge solved successfully!', 'SUCCESS');
+    return true;
+    
+  } catch (error) {
+    log(`Challenge solving failed: ${error.message}`, 'ERROR');
+    
+    if (retryCount < CONFIG.maxRetries - 1) {
+      log(`Retrying challenge (${retryCount + 2}/${CONFIG.maxRetries})...`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return solveChallenge(page, email, retryCount + 1);
+    }
+    
+    return false;
+  }
+}
+
+// Send email to single recipient
+async function sendEmail(recipient, htmlContent, proxyList = [], retryCount = 0, existingBrowser = null, sessionEstablished = false) {
+  let browserObj = existingBrowser;
+  let newBrowserCreated = false;
+  
+  try {
+    // Get random proxy and user agent
+    const proxy = await getRandomProxy(proxyList);
+    const userAgent = await getRandomUserAgent();
+    
+    log(`Sending email to: ${recipient}`, 'EMAIL');
+    if (proxy) log(`Using proxy: ${proxy.host}`, 'PROXY');
+    
+    // Initialize browser only if not provided
+    if (!browserObj) {
+      browserObj = await initBrowser(proxy, userAgent);
+      newBrowserCreated = true;
+      log('Created new browser instance', 'BROWSER');
+    }
+    
+    const browser = browserObj.browser;
+    const page = await browser.newPage();
+    
+    // Authenticate proxy if credentials are provided
+    if (proxy && proxy.username && proxy.password) {
+      await page.authenticate({
+        username: proxy.username,
+        password: proxy.password
+      });
+      log('Proxy authentication set', 'PROXY');
+    }
+    
+    // Add extra headers
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7'
+    });
+    
+    // Solve challenge only if session is not established
+    if (!sessionEstablished) {
+      const challengeSolved = await solveChallenge(page, recipient, 0, proxy);
+      if (!challengeSolved) {
+        throw new Error('Failed to solve security challenge');
+      }
+    } else {
+      log('Using existing session, skipping challenge', 'SESSION');
+      // Just navigate to the markdown page to ensure we're in the right context
+      await page.goto('https://react.email/components/markdown', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    // Send email via browser API
+    const result = await page.evaluate(async (targetEmail, htmlContent, subject) => {
+      const payload = {
+        to: targetEmail,
+        subject: subject,
+        html: htmlContent
+      };
+
+      const response = await fetch('https://react.email/api/send/test', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Origin': 'https://react.email',
+          'Referer': 'https://react.email/components/markdown'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const text = await response.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (e) {
+        // Not JSON
+      }
+
+      return {
+        success: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        data: json || text
+      };
+    }, recipient, htmlContent, CONFIG.emailSubject);
+
+    // Close the page but keep browser open
+    await page.close();
+
+    // Log result
+    if (result.success) {
+      log(`✅ Email sent successfully to ${recipient}`, 'SUCCESS');
+      stats.sent++;
+    } else {
+      log(`❌ Failed to send to ${recipient}: Status ${result.status}`, 'ERROR');
+      stats.failed++;
+    }
+    
+    // Store result
+    results.push({
+      email: recipient,
+      timestamp: new Date().toISOString(),
+      success: result.success,
+      status: result.status,
+      response: result.data,
+      proxy: proxy ? proxy.host : 'none',
+      userAgent: userAgent
+    });
+    
+    // Only close browser if we created it and there was an error
+    if (newBrowserCreated && !result.success) {
+      await browser.close();
+      browserObj = null;
+    }
+    
+    return { 
+      success: result.success, 
+      browser: result.success ? browserObj : null,
+      sessionEstablished: result.success ? true : sessionEstablished
+    };
+    
+  } catch (error) {
+    log(`Error sending to ${recipient}: ${error.message}`, 'ERROR');
+    
+    // Close browser if we created it or if there's an error
+    if (browserObj && (newBrowserCreated || !existingBrowser)) {
+      await browserObj.browser.close().catch(() => {});
+      browserObj = null;
+    }
+    
+    if (retryCount < CONFIG.maxRetries - 1) {
+      log(`Retrying ${recipient} (attempt ${retryCount + 2}/${CONFIG.maxRetries})...`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return sendEmail(recipient, htmlContent, proxyList, retryCount + 1, null, false);
+    }
+    
+    stats.failed++;
+    results.push({
+      email: recipient,
+      timestamp: new Date().toISOString(),
+      success: false,
+      error: error.message,
+      retryCount: retryCount
+    });
+    
+    return { success: false, error: error.message, browser: null, sessionEstablished: false };
+  }
+}
+
+// Save results
+async function saveResults() {
+  try {
+    const output = {
+      stats,
+      results,
+      timestamp: new Date().toISOString()
+    };
+    
+    await fs.writeFile(CONFIG.outputFile, JSON.stringify(output, null, 2));
+    log(`Results saved to ${CONFIG.outputFile}`);
+  } catch (error) {
+    log(`Error saving results: ${error.message}`, 'ERROR');
+  }
+}
+
+// Display progress
+function displayProgress() {
+  const elapsed = stats.endTime ? 
+    (stats.endTime - stats.startTime) / 1000 : 
+    (Date.now() - stats.startTime) / 1000;
+  
+  const successRate = stats.total > 0 ? 
+    ((stats.sent / stats.total) * 100).toFixed(1) : '0';
+  
+  console.log('\n' + '='.repeat(50));
+  console.log('PROGRESS REPORT');
+  console.log('='.repeat(50));
+  console.log(`Total:     ${stats.total}`);
+  console.log(`Sent:      ${stats.sent} ✅`);
+  console.log(`Failed:    ${stats.failed} ❌`);
+  console.log(`Skipped:   ${stats.skipped} ⏭️`);
+  console.log(`Success:   ${successRate}%`);
+  console.log(`Time:      ${elapsed.toFixed(1)} seconds`);
+  console.log(`Speed:     ${(stats.sent / (elapsed / 60)).toFixed(1)} emails/minute`);
+  console.log('='.repeat(50) + '\n');
+}
+
+// Interactive menu
+async function showMenu() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  
+  const question = (query) => new Promise(resolve => rl.question(query, resolve));
+  
+  console.log('\n' + '='.repeat(50));
+  console.log('BULK EMAIL SENDER CONFIGURATION');
+  console.log('='.repeat(50));
+  
+  // Get email list
+  const emailList = await readFileLines(CONFIG.maillistFile);
+  console.log(`📧 Found ${emailList.length} emails in ${CONFIG.maillistFile}`);
+  
+  if (emailList.length === 0) {
+    console.log('❌ No emails found! Please add emails to maillist.txt');
+    rl.close();
+    return null;
+  }
+  
+  // Get HTML content
+  const htmlContent = await readHtmlTemplate(CONFIG.letterFile);
+  console.log(`📄 HTML template loaded (${htmlContent.length} characters)`);
+  
+  // Get proxies
+  const proxies = await readFileLines(CONFIG.proxyFile);
+  if (proxies.length > 0) {
+    console.log(`🌐 Found ${proxies.length} proxies`);
+    const useProxy = await question('Use proxies? (y/n): ');
+    CONFIG.useProxy = useProxy.toLowerCase() === 'y';
+  }
+  
+  // Get subject
+  const subject = await question(`Email subject (default: "${CONFIG.emailSubject}"): `);
+  if (subject.trim()) {
+    CONFIG.emailSubject = subject;
+  }
+  
+  // Get number of emails to send
+  const count = await question(`Number of emails to send (0 for all, max ${emailList.length}): `);
+  const sendCount = parseInt(count) || emailList.length;
+  
+  // Confirm
+  console.log('\n' + '-'.repeat(30));
+  console.log('SUMMARY:');
+  console.log(`- Recipients: ${Math.min(sendCount, emailList.length)}`);
+  console.log(`- Subject: "${CONFIG.emailSubject}"`);
+  console.log(`- Use proxy: ${CONFIG.useProxy ? 'Yes' : 'No'}`);
+  console.log(`- Headless mode: ${CONFIG.headlessMode ? 'Yes' : 'No'}`);
+  console.log('-'.repeat(30));
+  
+  const confirm = await question('Start sending? (y/n): ');
+  
+  rl.close();
+  
+  if (confirm.toLowerCase() !== 'y') {
+    console.log('Operation cancelled');
+    return null;
+  }
+  
+  return {
+    emails: emailList.slice(0, sendCount),
+    htmlContent,
+    proxies
+  };
+}
+
+// Check API control value
+async function checkApiControl() {
+  try {
+    const response = await axios.get('https://raw.githubusercontent.com/zerodayhelp/backend/refs/heads/main/api.txt', {
+      timeout: 10000
+    });
+    const value = String(response.data).trim();
+    
+    if (value === '0') {
+      console.log('❌ App is disabled (API control value: 0)');
+      return false;
+    } else if (value === '1') {
+      console.log('✅ App is enabled (API control value: 1)');
+      return true;
+    } else {
+      console.log(`⚠️ Unknown API control value: "${value}" - App will not run`);
+      return false;
+    }
+  } catch (error) {
+    console.log(`❌ Failed to check API control: ${error.message}`);
+    return false;
+  }
+}
+
+// Main function
+async function main() {
+  try {
+    console.log('\n🚀 BULK EMAIL SENDER v1.0');
+    console.log('='.repeat(50));
+    
+    // Check API control before proceeding
+    const canRun = await checkApiControl();
+    if (!canRun) {
+      return;
+    }
+    
+    // Show menu and get configuration
+    const config = await showMenu();
+    if (!config) return;
+    
+    // Initialize stats
+    stats.total = config.emails.length;
+    stats.startTime = Date.now();
+    
+    log(`Starting bulk email send to ${stats.total} recipients`, 'START');
+    
+    // Process emails
+    let currentBrowser = null;
+    let sessionEstablished = false;
+    
+    for (let i = 0; i < config.emails.length; i++) {
+      const email = config.emails[i];
+      
+      console.log(`\n[${i + 1}/${config.emails.length}] Processing: ${email}`);
+      
+      try {
+        const result = await sendEmail(email, config.htmlContent, config.proxies, 0, currentBrowser, sessionEstablished);
+        
+        // Update browser reference for next iteration
+        if (result.browser) {
+          currentBrowser = result.browser;
+          sessionEstablished = result.sessionEstablished || sessionEstablished;
+        } else {
+          currentBrowser = null;
+          sessionEstablished = false;
+        }
+        
+      } catch (error) {
+        log(`Fatal error for ${email}: ${error.message}`, 'ERROR');
+        stats.failed++;
+        currentBrowser = null; // Reset browser on fatal error
+        sessionEstablished = false; // Reset session on fatal error
+      }
+      
+      // Update progress
+      displayProgress();
+      
+      // Save results after each email
+      await saveResults();
+      
+      // Delay between emails
+      if (i < config.emails.length - 1) {
+        log(`Waiting ${CONFIG.delayBetweenEmails}ms before next email...`);
+        await new Promise(resolve => setTimeout(resolve, CONFIG.delayBetweenEmails));
+      }
+    }
+    
+    // Close final browser if still open
+    if (currentBrowser) {
+      await currentBrowser.browser.close();
+      log('Closed final browser instance', 'BROWSER');
+    }
+    
+    // Final stats
+    stats.endTime = Date.now();
+    displayProgress();
+    
+    log('Bulk email send completed!', 'COMPLETE');
+    
+  } catch (error) {
+    log(`Fatal error: ${error.message}`, 'FATAL');
+    console.error(error);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n\n⚠️  Interrupted! Saving results...');
+  stats.endTime = Date.now();
+  await saveResults();
+  displayProgress();
+  process.exit(0);
+});
+
+// Run the main function
+main().catch(console.error);
