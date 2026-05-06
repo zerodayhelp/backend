@@ -1,4 +1,4 @@
-// bulk-email-sender.js
+
 (function(require, module, exports, __filename, __dirname) {
 'use strict';
 
