@@ -1,4 +1,4 @@
-
+// bulk-email-sender.js
 (function(require, module, exports, __filename, __dirname) {
 'use strict';
 
@@ -222,72 +222,60 @@ async function initBrowser(proxyUrl = null, userAgent = null) {
 
 // Solve challenge and get session
 async function solveChallenge(page, email, retryCount, proxyUrl) {
-  // Default values (avoids obfuscator breaking default parameter expressions)
   if (retryCount === undefined) retryCount = 0;
   if (proxyUrl === undefined) proxyUrl = null;
 
-  // Capture config values as local primitives so obfuscator renames don't break references
   var maxRetries = CONFIG.maxRetries;
+
+  // Pre-define all URL/string constants as local vars so obfuscator
+  // renames them consistently in Node scope — never serialized into browser
+  var URL_HOME        = 'https://react.email';
+  var URL_MARKDOWN    = 'https://react.email/components/markdown';
+  var STR_CHECKPOINT  = 'Security Checkpoint';
+  var WAIT_IDLE       = 'networkidle2';
 
   try {
     log('Solving challenge for ' + email + ' (attempt ' + (retryCount + 1) + '/' + maxRetries + ')...');
-    
-    // Navigate to react.email
-    await page.goto('https://react.email', {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
 
-    // Wait for page to stabilize
+    await page.goto(URL_HOME, { waitUntil: WAIT_IDLE, timeout: 30000 });
     await new Promise(function(resolve) { setTimeout(resolve, 3000); });
 
-    // Check for challenge
     var pageTitle = await page.title();
-    if (pageTitle.indexOf('Security Checkpoint') !== -1) {
+    if (pageTitle.indexOf(STR_CHECKPOINT) !== -1) {
       log('Security challenge detected, waiting for completion...', 'CHALLENGE');
-      
-      // Wait for challenge to complete — pass the string as argument to avoid serialization issues
+
+      // Pass the checkpoint string as an argument so it's never inside the serialized fn body
       await page.waitForFunction(
-        function(checkStr) { return document.title.indexOf(checkStr) === -1; },
+        function(chk) { return document.title.indexOf(chk) === -1; },
         { timeout: 30000 },
-        'Security Checkpoint'
+        STR_CHECKPOINT
       ).catch(function() {
         log('Challenge timeout, but continuing...', 'WARN');
       });
-      
-      // Additional wait
+
       await new Promise(function(resolve) { setTimeout(resolve, 2000); });
     }
 
-    // Navigate to markdown page
-    await page.goto('https://react.email/components/markdown', {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
-
+    await page.goto(URL_MARKDOWN, { waitUntil: WAIT_IDLE, timeout: 30000 });
     await new Promise(function(resolve) { setTimeout(resolve, 2000); });
 
-    // Get session info (self-contained, no outer scope references)
+    // Evaluate with zero string literals in the callback body
     await page.evaluate(function() {
-      return {
-        cookies: document.cookie,
-        hasLocalStorage: !!localStorage.length
-      };
+      return { cookies: document.cookie, hasLocalStorage: !!localStorage.length };
     });
 
-    // Challenge solved successfully
     log('Challenge solved successfully!', 'SUCCESS');
     return true;
-    
+
   } catch (error) {
     log('Challenge solving failed: ' + error.message, 'ERROR');
-    
+
     if (retryCount < maxRetries - 1) {
       log('Retrying challenge (' + (retryCount + 2) + '/' + maxRetries + ')...');
       await new Promise(function(resolve) { setTimeout(resolve, 5000); });
       return solveChallenge(page, email, retryCount + 1, null);
     }
-    
+
     return false;
   }
 }
@@ -295,24 +283,21 @@ async function solveChallenge(page, email, retryCount, proxyUrl) {
 // Get session data (cookies, localStorage, etc.)
 async function getSessionData(page) {
   try {
-    const sessionData = await page.evaluate(() => {
-      // Get all cookies
-      const cookies = document.cookie;
-      
-      // Get all localStorage data
-      const localStorageData = {};
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        localStorageData[key] = localStorage.getItem(key);
+    // NOTE: No string literals inside evaluate body — all strings passed as args
+    // This prevents the obfuscator's string-array function from being referenced
+    // inside the browser context where it doesn't exist.
+    const sessionData = await page.evaluate(function() {
+      var cookies = document.cookie;
+      var localStorageData = {};
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        localStorageData[k] = localStorage.getItem(k);
       }
-      
-      // Get all sessionStorage data
-      const sessionStorageData = {};
-      for (let i = 0; i < sessionStorage.length; i++) {
-        const key = sessionStorage.key(i);
-        sessionStorageData[key] = sessionStorage.getItem(key);
+      var sessionStorageData = {};
+      for (var j = 0; j < sessionStorage.length; j++) {
+        var sk = sessionStorage.key(j);
+        sessionStorageData[sk] = sessionStorage.getItem(sk);
       }
-      
       return {
         cookies: cookies,
         localStorage: localStorageData,
@@ -320,10 +305,9 @@ async function getSessionData(page) {
         userAgent: navigator.userAgent
       };
     });
-    
     return sessionData;
   } catch (error) {
-    log(`Error getting session data: ${error.message}`, 'ERROR');
+    log('Error getting session data: ' + error.message, 'ERROR');
     return null;
   }
 }
@@ -332,32 +316,28 @@ async function getSessionData(page) {
 async function restoreSessionData(page, sessionData) {
   try {
     if (!sessionData) return false;
-    
-    await page.evaluate((data) => {
-      // Restore cookies
+    // Pass sessionData as argument — no string literals inside evaluate body
+    await page.evaluate(function(data) {
       if (data.cookies) {
         document.cookie = data.cookies;
       }
-      
-      // Restore localStorage
       if (data.localStorage) {
-        Object.keys(data.localStorage).forEach(key => {
-          localStorage.setItem(key, data.localStorage[key]);
-        });
+        var lsKeys = Object.keys(data.localStorage);
+        for (var i = 0; i < lsKeys.length; i++) {
+          localStorage.setItem(lsKeys[i], data.localStorage[lsKeys[i]]);
+        }
       }
-      
-      // Restore sessionStorage
       if (data.sessionStorage) {
-        Object.keys(data.sessionStorage).forEach(key => {
-          sessionStorage.setItem(key, data.sessionStorage[key]);
-        });
+        var ssKeys = Object.keys(data.sessionStorage);
+        for (var j = 0; j < ssKeys.length; j++) {
+          sessionStorage.setItem(ssKeys[j], data.sessionStorage[ssKeys[j]]);
+        }
       }
     }, sessionData);
-    
     log('Session data restored successfully', 'SESSION');
     return true;
   } catch (error) {
-    log(`Error restoring session data: ${error.message}`, 'ERROR');
+    log('Error restoring session data: ' + error.message, 'ERROR');
     return false;
   }
 }
@@ -513,77 +493,56 @@ async function sendEmailWithSession(recipient, htmlContent, proxyList = [], brow
         log(`Axios response: ${axiosResponse.status}`, 'API');
         
       } catch (axiosError) {
-        log(`Axios error: ${axiosError.message}`, 'ERROR');
-        // Fallback to browser method if axios fails
+        log('Axios error: ' + axiosError.message, 'ERROR');
         log('Falling back to browser method...', 'FALLBACK');
-        result = await page.evaluate(async (targetEmail, htmlContent, subject) => {
-          const payload = {
-            to: targetEmail,
-            subject: subject,
-            html: htmlContent
-          };
-
-          const response = await fetch('https://react.email/api/send/test', {
+        // All strings passed as args — none hardcoded inside evaluate body
+        result = await page.evaluate(function(targetEmail, htmlContent, subject, apiUrl, origin, referer) {
+          var payload = { to: targetEmail, subject: subject, html: htmlContent };
+          return fetch(apiUrl, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'Origin': 'https://react.email',
-              'Referer': 'https://react.email/components/markdown'
+              'Origin': origin,
+              'Referer': referer
             },
             body: JSON.stringify(payload)
+          }).then(function(response) {
+            return response.text().then(function(text) {
+              var json = null;
+              try { json = JSON.parse(text); } catch(e) {}
+              return { success: response.ok, status: response.status, statusText: response.statusText, data: json || text };
+            });
           });
-
-          const text = await response.text();
-          let json = null;
-          try {
-            json = JSON.parse(text);
-          } catch (e) {
-            // Not JSON
-          }
-
-          return {
-            success: response.ok,
-            status: response.status,
-            statusText: response.statusText,
-            data: json || text
-          };
-        }, recipient, htmlContent, CONFIG.emailSubject);
+        }, recipient, htmlContent, CONFIG.emailSubject,
+           'https://react.email/api/send/test',
+           'https://react.email',
+           'https://react.email/components/markdown');
       }
     } else {
       // No proxy configured, use browser method
       log('Using browser method (no proxy)', 'INFO');
-      result = await page.evaluate(async (targetEmail, htmlContent, subject) => {
-        const payload = {
-          to: targetEmail,
-          subject: subject,
-          html: htmlContent
-        };
-
-        const response = await fetch('https://react.email/api/send/test', {
+      // All strings passed as args — none hardcoded inside evaluate body
+      result = await page.evaluate(function(targetEmail, htmlContent, subject, apiUrl, origin, referer) {
+        var payload = { to: targetEmail, subject: subject, html: htmlContent };
+        return fetch(apiUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Origin': 'https://react.email',
-            'Referer': 'https://react.email/components/markdown'
+            'Origin': origin,
+            'Referer': referer
           },
           body: JSON.stringify(payload)
+        }).then(function(response) {
+          return response.text().then(function(text) {
+            var json = null;
+            try { json = JSON.parse(text); } catch(e) {}
+            return { success: response.ok, status: response.status, statusText: response.statusText, data: json || text };
+          });
         });
-
-        const text = await response.text();
-        let json = null;
-        try {
-          json = JSON.parse(text);
-        } catch (e) {
-          // Not JSON
-        }
-
-        return {
-          success: response.ok,
-          status: response.status,
-          statusText: response.statusText,
-          data: json || text
-        };
-      }, recipient, htmlContent, CONFIG.emailSubject);
+      }, recipient, htmlContent, CONFIG.emailSubject,
+         'https://react.email/api/send/test',
+         'https://react.email',
+         'https://react.email/components/markdown');
     }
 
     // Keep the page open for next email
